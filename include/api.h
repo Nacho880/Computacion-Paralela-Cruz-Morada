@@ -72,7 +72,7 @@ private:
     FetchResult fetch_gender_from_api(const string& uuid);
     bool try_get_cached(const string& uuid, string& gender_out) const;
     void store_cache_entry(const string& uuid, const string& gender);
-    void enqueue_cache_line(string line);       // ← recibe string ya formateado
+    void enqueue_cache_line(string line);       
     void flush_cache_writer();
     void open_cache_writer();
     void start_disk_writer();
