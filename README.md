@@ -8,8 +8,6 @@
 - [Camilo Moya       21.230.348-8]
 - [Ignacio Ortega    21.481.176-6]
 
-**Repositorio:** [URL del repositorio]
-
 ---
 
 ## Descripción
