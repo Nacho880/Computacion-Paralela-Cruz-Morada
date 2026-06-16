@@ -25,7 +25,7 @@ int configure_openmp_threads() {
     return threads;
 }
 
-} 
+}  // namespace
 
 int main() {
     const double start_time = omp_get_wtime();

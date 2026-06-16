@@ -21,7 +21,7 @@ constexpr const char* NOT_FOUND_MARKER = "NOT_FOUND";
 constexpr size_t CACHE_SHARD_COUNT = 64;
 constexpr size_t SEEN_SHARD_COUNT = 64;
 constexpr int API_MAX_CONCURRENT_DEFAULT = 96;
-constexpr long API_TIMEOUT_DEFAULT = 30;
+constexpr long API_TIMEOUT_DEFAULT = 5;
 constexpr int API_MAX_TEMP_RETRIES = 3;
 
 enum class Result {
@@ -72,7 +72,7 @@ private:
     FetchResult fetch_gender_from_api(const string& uuid);
     bool try_get_cached(const string& uuid, string& gender_out) const;
     void store_cache_entry(const string& uuid, const string& gender);
-    void enqueue_cache_line(string line);       // ← recibe string ya formateado
+    void enqueue_cache_line(string uuid, string gender);
     void flush_cache_writer();
     void open_cache_writer();
     void start_disk_writer();
@@ -105,9 +105,11 @@ private:
     thread disk_writer_thread_;
     ofstream cache_writer_;
     atomic<long long> cache_writes_since_flush_{0};
-    static constexpr long  CACHE_FLUSH_EVERY      = 5000;
-    static constexpr size_t DISK_QUEUE_HIGH_WATER = 16384;  
+    static constexpr long CACHE_FLUSH_EVERY = 5000;
+    static constexpr size_t DISK_QUEUE_HIGH_WATER = 8192;
 
+    mutex slots_mutex_;
+    condition_variable slots_cv_;
     atomic<int> active_requests_{0};
 
     mutable atomic<long long> cache_hits_{0};

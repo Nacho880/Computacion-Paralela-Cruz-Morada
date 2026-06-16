@@ -57,8 +57,14 @@ static size_t seen_shard_index(const string& key) {
 
 long parse_env_long(const char* name, long fallback) {
     const char* value = getenv(name);
-    if (!value || value[0] == '\0') return fallback;
-    try { return stol(value); } catch (...) { return fallback; }
+    if (!value || value[0] == '\0') {
+        return fallback;
+    }
+    try {
+        return stol(value);
+    } catch (...) {
+        return fallback;
+    }
 }
 
 int parse_env_int(const char* name, int fallback) {
@@ -105,16 +111,6 @@ void print_progress_snapshot(long long resolved_total, long long total_target, d
     console_print(out.str());
 }
 
-string make_cache_line(const string& uuid, const string& gender) {
-    string line;
-    line.reserve(uuid.size() + gender.size() + 2);
-    line  = uuid;
-    line += '|';
-    line += gender;
-    line += '\n';
-    return line;
-}
-
 }  // namespace
 
 size_t ApiClient::write_callback(void* contents, size_t size, size_t nmemb, void* userp) {
@@ -135,27 +131,29 @@ ApiClient::~ApiClient() {
     stop_disk_writer();
 }
 
-string ApiClient::display_rut() const { return rut_display_; }
-int    ApiClient::max_concurrent()  const { return max_concurrent_; }
-long   ApiClient::timeout_seconds() const { return timeout_seconds_; }
+string ApiClient::display_rut() const {
+    return rut_display_;
+}
+
+int ApiClient::max_concurrent() const {
+    return max_concurrent_;
+}
+
+long ApiClient::timeout_seconds() const {
+    return timeout_seconds_;
+}
 
 void ApiClient::acquire_request_slot() {
-    while (true) {
-        int current = active_requests_.load(memory_order_relaxed);
-        if (current < max_concurrent_) {
-            if (active_requests_.compare_exchange_weak(
-                    current, current + 1,
-                    memory_order_acquire,
-                    memory_order_relaxed)) {
-                return;
-            }
-        }
-        this_thread::yield();
-    }
+    unique_lock<mutex> lock(slots_mutex_);
+    slots_cv_.wait(lock, [this]() {
+        return active_requests_.load(memory_order_relaxed) < max_concurrent_;
+    });
+    active_requests_.fetch_add(1, memory_order_relaxed);
 }
 
 void ApiClient::release_request_slot() {
-    active_requests_.fetch_sub(1, memory_order_release);
+    active_requests_.fetch_sub(1, memory_order_relaxed);
+    slots_cv_.notify_one();
 }
 
 CURL* ApiClient::get_thread_curl() {
@@ -172,8 +170,6 @@ CURL* ApiClient::get_thread_curl() {
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback_impl);
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
         configured = true;
     }
 
@@ -185,20 +181,26 @@ bool ApiClient::try_get_cached(const string& uuid, string& gender_out) const {
     const auto& shard = cache_shards_[idx];
     shared_lock<shared_mutex> lock(shard.mutex);
     const auto it = shard.map.find(uuid);
-    if (it == shard.map.end()) return false;
+    if (it == shard.map.end()) {
+        return false;
+    }
     gender_out = it->second;
     return true;
 }
 
 void ApiClient::open_cache_writer() {
-    if (cache_writer_.is_open()) return;
+    if (cache_writer_.is_open()) {
+        return;
+    }
     cache_writer_.open(cache_path_, ios::app | ios::out);
     cache_writes_since_flush_.store(0, memory_order_relaxed);
     start_disk_writer();
 }
 
 void ApiClient::start_disk_writer() {
-    if (disk_writer_running_.exchange(true, memory_order_acq_rel)) return;
+    if (disk_writer_running_.exchange(true, memory_order_acq_rel)) {
+        return;
+    }
 
     disk_writer_thread_ = thread([this]() {
         vector<string> batch;
@@ -219,16 +221,17 @@ void ApiClient::start_disk_writer() {
                     disk_write_queue_.pop();
                 }
 
-                if (disk_write_queue_.size() < DISK_QUEUE_HIGH_WATER / 2) {
-                    disk_queue_cv_.notify_one();
+                const bool done =
+                    !disk_writer_running_.load(memory_order_acquire) &&
+                    disk_write_queue_.empty() && batch.empty();
+                if (done) {
+                    break;
                 }
-
-                const bool done = !disk_writer_running_.load(memory_order_acquire) &&
-                                  disk_write_queue_.empty() && batch.empty();
-                if (done) break;
             }
 
-            if (batch.empty()) continue;
+            if (batch.empty()) {
+                continue;
+            }
 
             if (cache_writer_.is_open()) {
                 for (const string& line : batch) {
@@ -240,31 +243,51 @@ void ApiClient::start_disk_writer() {
                     writes_since_flush = 0;
                 }
             }
+
+            {
+                lock_guard<mutex> lock(disk_queue_mutex_);
+                if (disk_write_queue_.size() < DISK_QUEUE_HIGH_WATER / 2) {
+                    disk_queue_cv_.notify_all();
+                }
+            }
         }
 
-        if (cache_writer_.is_open()) cache_writer_.flush();
+        if (cache_writer_.is_open()) {
+            cache_writer_.flush();
+        }
     });
 }
 
 void ApiClient::stop_disk_writer() {
-    if (!disk_writer_running_.load(memory_order_acquire)) return;
+    if (!disk_writer_running_.load(memory_order_acquire)) {
+        return;
+    }
+
     disk_writer_running_.store(false, memory_order_release);
     disk_queue_cv_.notify_all();
-    if (disk_writer_thread_.joinable()) disk_writer_thread_.join();
+
+    if (disk_writer_thread_.joinable()) {
+        disk_writer_thread_.join();
+    }
 }
 
-void ApiClient::enqueue_cache_line(string line) {
+void ApiClient::enqueue_cache_line(string uuid, string gender) {
+    ostringstream line;
+    line << uuid << '|' << gender << '\n';
+
     unique_lock<mutex> lock(disk_queue_mutex_);
     disk_queue_cv_.wait(lock, [this]() {
         return disk_write_queue_.size() < DISK_QUEUE_HIGH_WATER;
     });
-    disk_write_queue_.push(move(line));
+    disk_write_queue_.push(line.str());
     disk_queue_cv_.notify_one();
 }
 
 void ApiClient::flush_cache_writer() {
     stop_disk_writer();
-    if (cache_writer_.is_open()) cache_writer_.flush();
+    if (cache_writer_.is_open()) {
+        cache_writer_.flush();
+    }
 }
 
 void ApiClient::flush_disk_cache() {
@@ -272,16 +295,13 @@ void ApiClient::flush_disk_cache() {
 }
 
 void ApiClient::store_cache_entry(const string& uuid, const string& gender) {
-    string line = make_cache_line(uuid, gender);
-
     const size_t idx = shard_index(uuid);
     auto& shard = cache_shards_[idx];
     {
         unique_lock<shared_mutex> lock(shard.mutex);
         shard.map.emplace(uuid, gender);
     }
-
-    enqueue_cache_line(move(line));
+    enqueue_cache_line(uuid, gender);
     resolved_count_.fetch_add(1, memory_order_relaxed);
 }
 
@@ -339,16 +359,19 @@ FetchResult ApiClient::fetch_gender_from_api_once(const string& uuid) {
         result.status = Result::AUTH_ERROR;
         return result;
     }
+
     if (response.http_code == 404) {
         Logger::instance().accumulate_uuid_not_found(uuid);
         result.status = Result::NOT_FOUND;
         return result;
     }
+
     if (response.http_code >= 500) {
         Logger::instance().accumulate_api_error("http");
         result.status = Result::TEMP_ERROR;
         return result;
     }
+
     if (response.http_code != 200) {
         Logger::instance().accumulate_api_error("http");
         result.status = Result::TEMP_ERROR;
@@ -372,8 +395,9 @@ FetchResult ApiClient::fetch_gender_from_api(const string& uuid) {
     for (int attempt = 0; attempt < API_MAX_TEMP_RETRIES; ++attempt) {
         FetchResult result = fetch_gender_from_api_once(uuid);
 
-        if (result.status == Result::OK || result.status == Result::NOT_FOUND)
+        if (result.status == Result::OK || result.status == Result::NOT_FOUND) {
             return result;
+        }
 
         if (result.status == Result::AUTH_ERROR) {
             if (!reauthed && authenticate(false)) {
@@ -384,8 +408,9 @@ FetchResult ApiClient::fetch_gender_from_api(const string& uuid) {
             return result;
         }
 
-        if (attempt + 1 < API_MAX_TEMP_RETRIES)
+        if (attempt + 1 < API_MAX_TEMP_RETRIES) {
             this_thread::sleep_for(chrono::milliseconds(50 * static_cast<int>(attempt + 1)));
+        }
     }
 
     return {Result::TEMP_ERROR, ""};
@@ -439,8 +464,9 @@ bool ApiClient::authenticate(bool verbose) {
               << "HTTP: " << response.http_code << '\n'
               << "BODY: " << response.body << '\n'
               << "=================\n";
-    if (verbose) console_print(login_out.str());
-
+    if (verbose) {
+        console_print(login_out.str());
+    }
     if (response.http_code != 200) {
         Logger::instance().accumulate_api_error("http");
         return false;
@@ -466,12 +492,19 @@ PipelineStats ApiClient::resolve_uuids_pipeline(const vector<string>& csv_files)
     mutex queue_mutex;
     condition_variable queue_not_empty;
     condition_variable queue_not_full;
-    const size_t max_queue = static_cast<size_t>(max_concurrent_) * 16;
+    const size_t max_queue = static_cast<size_t>(max_concurrent_) * 8;
     atomic<bool> producer_done{false};
+
+    queue<string> pending_queue;
+    mutex pending_mutex;
+    condition_variable pending_not_empty;
+    atomic<bool> scan_done{false};
 
     array<unordered_set<string>, SEEN_SHARD_COUNT> seen_shards;
     array<mutex, SEEN_SHARD_COUNT> seen_mutexes;
-    for (auto& shard : seen_shards) shard.reserve(50'000);
+    for (auto& shard : seen_shards) {
+        shard.reserve(50'000);
+    }
 
     queue<string> retry_queue;
     mutex retry_mutex;
@@ -488,23 +521,23 @@ PipelineStats ApiClient::resolve_uuids_pipeline(const vector<string>& csv_files)
     atomic<long long> cached_at_scan{0};
     atomic<long long> api_start_ns{0};
     atomic<long long> last_reported_api_resolved{0};
-    atomic<double>    last_report_wtime{0.0};
+    atomic<double> last_report_wtime{0.0};
     atomic<long long> last_report_api_resolved{0};
-    atomic<bool>      metrics_baseline_set{false};
-    atomic<long long> unique_total{0};
+    atomic<bool> metrics_baseline_set{false};
 
-    const int n_workers = max_concurrent_;
-    const int n_threads = n_workers + 2;
-    atomic<int> pipeline_remaining{n_workers + 1}; 
+    atomic<long long> unique_total{0};
+    atomic<int> pipeline_remaining{max_concurrent_ + 2};
 
     const int saved_active_levels = omp_get_max_active_levels();
-    if (saved_active_levels < 2) omp_set_max_active_levels(2);
+    if (saved_active_levels < 2) {
+        omp_set_max_active_levels(2);
+    }
 
-#pragma omp parallel num_threads(n_threads) \
+#pragma omp parallel num_threads(max_concurrent_ + 3) \
     shared(work_queue, queue_mutex, queue_not_empty, queue_not_full, producer_done, \
-           seen_shards, seen_mutexes, retry_queue, retry_mutex, \
-           skipped_cache, queued, window_resolved, csv_files, stats, \
-           unique_total, total_unique_uuids, cached_at_scan, api_start_ns, \
+           pending_queue, pending_mutex, pending_not_empty, scan_done, seen_shards, \
+           seen_mutexes, retry_queue, retry_mutex, skipped_cache, queued, window_resolved, \
+           csv_files, stats, unique_total, total_unique_uuids, cached_at_scan, api_start_ns, \
            metrics_baseline_set, last_reported_api_resolved, last_report_wtime, \
            last_report_api_resolved, pipeline_remaining, csv_start, max_queue)
     {
@@ -512,8 +545,6 @@ PipelineStats ApiClient::resolve_uuids_pipeline(const vector<string>& csv_files)
 
         if (tid == 0) {
             while (pipeline_running_.load(memory_order_relaxed)) {
-                this_thread::sleep_for(chrono::seconds(1));
-
                 {
                     const int retry_budget = max(1, max_concurrent_ / 4);
                     int moved = 0;
@@ -521,32 +552,38 @@ PipelineStats ApiClient::resolve_uuids_pipeline(const vector<string>& csv_files)
                         string uuid;
                         {
                             lock_guard<mutex> rlock(retry_mutex);
-                            if (retry_queue.empty()) break;
+                            if (retry_queue.empty()) {
+                                break;
+                            }
                             uuid = move(retry_queue.front());
                             retry_queue.pop();
                         }
-                        {
-                            unique_lock<mutex> wlock(queue_mutex);
-                            if (work_queue.size() >= max_queue) {
-                                lock_guard<mutex> rlock(retry_mutex);
-                                retry_queue.push(move(uuid));
-                                break;
-                            }
-                            work_queue.push(move(uuid));
-                            pending_uuids_.fetch_add(1, memory_order_relaxed);
+
+                        unique_lock<mutex> wlock(queue_mutex);
+                        if (work_queue.size() >= max_queue) {
+                            lock_guard<mutex> rlock(retry_mutex);
+                            retry_queue.push(move(uuid));
+                            break;
                         }
-                        queue_not_empty.notify_one();
+                        work_queue.push(move(uuid));
+                        pending_uuids_.fetch_add(1, memory_order_relaxed);
                         ++moved;
+                    }
+                    if (moved > 0) {
+                        queue_not_empty.notify_all();
                     }
                 }
 
-                // Progreso
-                const long long target       = total_unique_uuids.load(memory_order_relaxed);
-                const long long start_ns     = api_start_ns.load(memory_order_relaxed);
-                const long long cached       = cached_at_scan.load(memory_order_relaxed);
+                this_thread::sleep_for(chrono::seconds(1));
+                const long long target = total_unique_uuids.load(memory_order_relaxed);
+                const long long start_ns = api_start_ns.load(memory_order_relaxed);
+                const long long cached = cached_at_scan.load(memory_order_relaxed);
                 const long long api_resolved = resolved_count_.load(memory_order_relaxed);
+                const long long resolved_total = cached + api_resolved;
 
-                if (target <= 0 || start_ns <= 0) continue;
+                if (target <= 0 || start_ns <= 0) {
+                    continue;
+                }
 
                 const double phase_start = static_cast<double>(start_ns) * 1e-9;
                 const double now = omp_get_wtime();
@@ -561,41 +598,83 @@ PipelineStats ApiClient::resolve_uuids_pipeline(const vector<string>& csv_files)
                 const long long current_block = api_resolved / report_interval;
                 const long long last_block =
                     last_reported_api_resolved.load(memory_order_relaxed) / report_interval;
-                if (current_block <= last_block) continue;
+                if (current_block <= last_block) {
+                    continue;
+                }
 
                 last_reported_api_resolved.store(current_block * report_interval,
                                                  memory_order_relaxed);
 
-                const double prev_wtime      = last_report_wtime.load(memory_order_relaxed);
-                const long long prev_api     = last_report_api_resolved.load(memory_order_relaxed);
-                const double delta_t         = now - prev_wtime;
-                const long long delta_r      = api_resolved - prev_api;
-                double velocity = (delta_t > 0.0 && delta_r > 0)
-                                  ? static_cast<double>(delta_r) / delta_t : 0.0;
+                const double prev_wtime = last_report_wtime.load(memory_order_relaxed);
+                const long long prev_api = last_report_api_resolved.load(memory_order_relaxed);
+                const double delta_t = now - prev_wtime;
+                const long long delta_r = api_resolved - prev_api;
+
+                double velocity = 0.0;
+                if (delta_t > 0.0 && delta_r > 0) {
+                    velocity = static_cast<double>(delta_r) / delta_t;
+                }
 
                 const long long remaining_api = max(0LL, (target - cached) - api_resolved);
-                const long long eta_seconds   = velocity > 0.0
-                    ? static_cast<long long>(static_cast<double>(remaining_api) / velocity + 0.5)
-                    : 0LL;
+                const long long eta_seconds =
+                    velocity > 0.0
+                        ? static_cast<long long>(static_cast<double>(remaining_api) / velocity + 0.5)
+                        : 0LL;
+                const long long elapsed_seconds = static_cast<long long>(now - phase_start + 0.5);
 
                 last_report_wtime.store(now, memory_order_relaxed);
                 last_report_api_resolved.store(api_resolved, memory_order_relaxed);
 
-                print_progress_snapshot(cached + api_resolved, target, velocity, eta_seconds,
-                                        static_cast<long long>(now - phase_start + 0.5));
+                print_progress_snapshot(resolved_total, target, velocity, eta_seconds,
+                                        elapsed_seconds);
+            }
+        } else if (tid == 1) {
+            while (true) {
+                string uuid;
+                {
+                    unique_lock<mutex> lock(pending_mutex);
+                    pending_not_empty.wait(lock, [&]() {
+                        return !pending_queue.empty() || scan_done.load(memory_order_relaxed);
+                    });
+                    if (pending_queue.empty() && scan_done.load(memory_order_relaxed)) {
+                        break;
+                    }
+                    if (pending_queue.empty()) {
+                        continue;
+                    }
+                    uuid = move(pending_queue.front());
+                    pending_queue.pop();
+                }
+
+                {
+                    unique_lock<mutex> lock(queue_mutex);
+                    queue_not_full.wait(lock, [&]() { return work_queue.size() < max_queue; });
+                    work_queue.push(move(uuid));
+                    pending_uuids_.fetch_add(1, memory_order_relaxed);
+                    queue_not_empty.notify_one();
+                }
             }
 
-        } else if (tid == 1) {
+            producer_done.store(true, memory_order_relaxed);
+            queue_not_empty.notify_all();
+
+            if (pipeline_remaining.fetch_sub(1, memory_order_acq_rel) == 1) {
+                pipeline_running_.store(false, memory_order_relaxed);
+            }
+        } else if (tid == 2) {
             scan_csv_files_for_uuids(
                 csv_files,
                 [this, &seen_shards, &seen_mutexes, &skipped_cache, &unique_total](
                     const string& uuid) -> bool {
-                    const size_t si = seen_shard_index(uuid);
+                    const size_t shard_idx = seen_shard_index(uuid);
                     {
-                        lock_guard<mutex> lock(seen_mutexes[si]);
-                        if (!seen_shards[si].insert(uuid).second) return false;
+                        lock_guard<mutex> lock(seen_mutexes[shard_idx]);
+                        if (!seen_shards[shard_idx].insert(uuid).second) {
+                            return false;
+                        }
                     }
                     unique_total.fetch_add(1, memory_order_relaxed);
+
                     string cached;
                     if (try_get_cached(uuid, cached)) {
                         skipped_cache.fetch_add(1, memory_order_relaxed);
@@ -606,39 +685,33 @@ PipelineStats ApiClient::resolve_uuids_pipeline(const vector<string>& csv_files)
                 },
                 [&](string uuid) {
                     {
-                        unique_lock<mutex> lock(queue_mutex);
-                        queue_not_full.wait(lock, [&]() {
-                            return work_queue.size() < max_queue;
-                        });
-                        work_queue.push(move(uuid));
-                        pending_uuids_.fetch_add(1, memory_order_relaxed);
+                        lock_guard<mutex> lock(pending_mutex);
+                        pending_queue.push(move(uuid));
                         queued.fetch_add(1, memory_order_relaxed);
                     }
-                    queue_not_empty.notify_all();
+                    pending_not_empty.notify_one();
                 });
 
             stats.unique_uuids_seen = unique_total.load(memory_order_relaxed);
-            stats.csv_scan_seconds  = omp_get_wtime() - csv_start;
+            stats.csv_scan_seconds = omp_get_wtime() - csv_start;
 
-            const long long queued_count        = queued.load(memory_order_relaxed);
+            const long long queued_count = queued.load(memory_order_relaxed);
             const long long skipped_cache_count = skipped_cache.load(memory_order_relaxed);
 
-            print_scan_summary(stats.unique_uuids_seen, stats.csv_scan_seconds,
-                               skipped_cache_count, queued_count);
+            print_scan_summary(stats.unique_uuids_seen, stats.csv_scan_seconds, skipped_cache_count,
+                               queued_count);
 
             cached_at_scan.store(skipped_cache_count, memory_order_relaxed);
             total_unique_uuids.store(stats.unique_uuids_seen, memory_order_relaxed);
-            api_start_ns.store(static_cast<long long>(omp_get_wtime() * 1e9),
-                               memory_order_relaxed);
+            api_start_ns.store(static_cast<long long>(omp_get_wtime() * 1e9), memory_order_relaxed);
             metrics_baseline_set.store(false, memory_order_relaxed);
 
-            producer_done.store(true, memory_order_relaxed);
-            queue_not_empty.notify_all();  // despierta todos los workers para que terminen
+            scan_done.store(true, memory_order_relaxed);
+            pending_not_empty.notify_all();
 
             if (pipeline_remaining.fetch_sub(1, memory_order_acq_rel) == 1) {
                 pipeline_running_.store(false, memory_order_relaxed);
             }
-
         } else {
             while (true) {
                 string uuid;
@@ -649,12 +722,18 @@ PipelineStats ApiClient::resolve_uuids_pipeline(const vector<string>& csv_files)
                     });
                     if (work_queue.empty()) {
                         if (producer_done.load(memory_order_relaxed)) {
-                            bool retry_empty;
+                            bool can_exit = false;
                             {
                                 lock_guard<mutex> rlock(retry_mutex);
-                                retry_empty = retry_queue.empty();
+                                can_exit = retry_queue.empty();
                             }
-                            if (retry_empty) break;
+                            if (can_exit) {
+                                lock_guard<mutex> wlock(queue_mutex);
+                                can_exit = work_queue.empty();
+                            }
+                            if (can_exit) {
+                                break;
+                            }
                         }
                         continue;
                     }
@@ -692,17 +771,21 @@ PipelineStats ApiClient::resolve_uuids_pipeline(const vector<string>& csv_files)
 
     omp_set_max_active_levels(saved_active_levels);
 
-    // Drena reintentos restantes secuencialmente
     while (true) {
         string uuid;
         {
             lock_guard<mutex> lock(retry_mutex);
-            if (retry_queue.empty()) break;
+            if (retry_queue.empty()) {
+                break;
+            }
             uuid = move(retry_queue.front());
             retry_queue.pop();
         }
+
         string cached;
-        if (try_get_cached(uuid, cached)) continue;
+        if (try_get_cached(uuid, cached)) {
+            continue;
+        }
 
         const FetchResult fetched = fetch_gender_from_api(uuid);
         if (fetched.status == Result::OK) {
@@ -717,38 +800,42 @@ PipelineStats ApiClient::resolve_uuids_pipeline(const vector<string>& csv_files)
     }
 
     stats.unique_uuids_seen = unique_total.load(memory_order_relaxed);
-    const long long queued_count        = queued.load(memory_order_relaxed);
+    const long long queued_count = queued.load(memory_order_relaxed);
     const long long skipped_cache_count = skipped_cache.load(memory_order_relaxed);
-    const long long final_resolved      = resolved_count_.load(memory_order_relaxed);
-    const long long total_target        = total_unique_uuids.load(memory_order_relaxed);
-    const long long cached_count        = cached_at_scan.load(memory_order_relaxed);
-    const double api_phase_start =
-        static_cast<double>(api_start_ns.load(memory_order_relaxed)) * 1e-9;
+
+    const long long final_resolved = resolved_count_.load(memory_order_relaxed);
+    const long long total_target = total_unique_uuids.load(memory_order_relaxed);
+    const long long cached = cached_at_scan.load(memory_order_relaxed);
+    const long long resolved_total = cached + final_resolved;
+    const long long api_start_ns_value = api_start_ns.load(memory_order_relaxed);
+    const double api_phase_start = static_cast<double>(api_start_ns_value) * 1e-9;
 
     if (final_resolved > 0 && total_target > 0 &&
         final_resolved != last_reported_api_resolved.load(memory_order_relaxed)) {
-        const double now         = omp_get_wtime();
-        const double prev_wtime  = last_report_wtime.load(memory_order_relaxed);
+        const double now = omp_get_wtime();
+        const double prev_wtime = last_report_wtime.load(memory_order_relaxed);
         const long long prev_api = last_report_api_resolved.load(memory_order_relaxed);
+
         double velocity = 0.0;
         if (prev_wtime > 0.0) {
-            const double delta_t    = now - prev_wtime;
+            const double delta_t = now - prev_wtime;
             const long long delta_r = final_resolved - prev_api;
-            if (delta_t > 0.0 && delta_r > 0)
+            if (delta_t > 0.0 && delta_r > 0) {
                 velocity = static_cast<double>(delta_r) / delta_t;
+            }
         }
-        const long long remaining_api =
-            max(0LL, (total_target - cached_count) - final_resolved);
-        const long long eta_seconds = velocity > 0.0
-            ? static_cast<long long>(static_cast<double>(remaining_api) / velocity + 0.5)
-            : 0LL;
-        print_progress_snapshot(cached_count + final_resolved, total_target, velocity,
-                                eta_seconds,
+
+        const long long remaining_api = max(0LL, (total_target - cached) - final_resolved);
+        const long long eta_seconds =
+            velocity > 0.0
+                ? static_cast<long long>(static_cast<double>(remaining_api) / velocity + 0.5)
+                : 0LL;
+        print_progress_snapshot(resolved_total, total_target, velocity, eta_seconds,
                                 static_cast<long long>(now - api_phase_start + 0.5));
     }
 
-    stats.api_wall_seconds    = omp_get_wtime() - pipeline_start;
-    stats.uuids_queued        = queued_count;
+    stats.api_wall_seconds = omp_get_wtime() - pipeline_start;
+    stats.uuids_queued = queued_count;
     stats.uuids_skipped_cache = skipped_cache_count;
     flush_cache_writer();
 
@@ -762,23 +849,32 @@ string ApiClient::lookup_gender(const string& uuid) const {
     const auto it = shard.map.find(uuid);
     if (it != shard.map.end()) {
         cache_hits_.fetch_add(1, memory_order_relaxed);
-        return (it->second == NOT_FOUND_MARKER) ? "" : it->second;
+        if (it->second == NOT_FOUND_MARKER) {
+            return "";
+        }
+        return it->second;
     }
     return "";
 }
 
 void ApiClient::load_disk_cache(const string& path) {
     ifstream input(path);
-    if (!input.is_open()) return;
+    if (!input.is_open()) {
+        return;
+    }
 
     vector<pair<string, string>> entries;
     entries.reserve(3'500'000);
     string line;
     line.reserve(128);
     while (getline(input, line)) {
-        if (line.empty()) continue;
+        if (line.empty()) {
+            continue;
+        }
         const size_t sep = line.find('|');
-        if (sep == string::npos) continue;
+        if (sep == string::npos) {
+            continue;
+        }
         entries.emplace_back(line.substr(0, sep), line.substr(sep + 1));
     }
     cache_path_ = path;
@@ -794,27 +890,44 @@ void ApiClient::load_disk_cache(const string& path) {
 void ApiClient::save_disk_cache_force(const string& path) const {
     vector<pair<string, string>> snapshot;
     snapshot.reserve(3'500'000);
-    for (size_t i = 0; i < CACHE_SHARD_COUNT; ++i) {
-        const auto& shard = cache_shards_[i];
+    for (size_t shard_idx = 0; shard_idx < CACHE_SHARD_COUNT; ++shard_idx) {
+        const auto& shard = cache_shards_[shard_idx];
         shared_lock<shared_mutex> lock(shard.mutex);
-        for (const auto& entry : shard.map)
+        for (const auto& entry : shard.map) {
             snapshot.emplace_back(entry.first, entry.second);
+        }
     }
+
     ofstream output(path, ios::trunc);
-    if (!output.is_open()) return;
-    for (const auto& entry : snapshot)
+    if (!output.is_open()) {
+        return;
+    }
+
+    for (const auto& entry : snapshot) {
         output << entry.first << '|' << entry.second << '\n';
+    }
 }
 
-long long ApiClient::cache_hits()     const { return cache_hits_.load(memory_order_relaxed); }
-long long ApiClient::api_calls()      const { return api_calls_.load(memory_order_relaxed); }
-long long ApiClient::resolved_count() const { return resolved_count_.load(memory_order_relaxed); }
-long long ApiClient::pending_uuids()  const { return pending_uuids_.load(memory_order_relaxed); }
+long long ApiClient::cache_hits() const {
+    return cache_hits_.load(memory_order_relaxed);
+}
+
+long long ApiClient::api_calls() const {
+    return api_calls_.load(memory_order_relaxed);
+}
+
+long long ApiClient::resolved_count() const {
+    return resolved_count_.load(memory_order_relaxed);
+}
+
+long long ApiClient::pending_uuids() const {
+    return pending_uuids_.load(memory_order_relaxed);
+}
 
 long long ApiClient::cache_size() const {
     long long total = 0;
-    for (size_t i = 0; i < CACHE_SHARD_COUNT; ++i) {
-        const auto& shard = cache_shards_[i];
+    for (size_t shard_idx = 0; shard_idx < CACHE_SHARD_COUNT; ++shard_idx) {
+        const auto& shard = cache_shards_[shard_idx];
         shared_lock<shared_mutex> lock(shard.mutex);
         total += static_cast<long long>(shard.map.size());
     }
