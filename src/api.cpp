@@ -633,7 +633,7 @@ PipelineStats ApiClient::resolve_uuids_pipeline(const vector<string>& csv_files)
             metrics_baseline_set.store(false, memory_order_relaxed);
 
             producer_done.store(true, memory_order_relaxed);
-            queue_not_empty.notify_all();  // despierta todos los workers para que terminen
+            queue_not_empty.notify_all();  
 
             if (pipeline_remaining.fetch_sub(1, memory_order_acq_rel) == 1) {
                 pipeline_running_.store(false, memory_order_relaxed);
@@ -692,7 +692,7 @@ PipelineStats ApiClient::resolve_uuids_pipeline(const vector<string>& csv_files)
 
     omp_set_max_active_levels(saved_active_levels);
 
-    // Drena reintentos restantes secuencialmente
+    
     while (true) {
         string uuid;
         {
