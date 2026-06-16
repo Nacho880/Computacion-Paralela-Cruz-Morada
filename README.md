@@ -111,7 +111,7 @@ La cantidad de hilos se configura automáticamente según los núcleos disponibl
 
 ```bash
 API_MAX_CONCURRENT=96 ./trabajoparalelo   # hilos para consultas API
-API_TIMEOUT=30 ./trabajoparalelo          # timeout en segundos por request
+API_TIMEOUT=5 ./trabajoparalelo          # timeout en segundos por request
 ```
 
 ---
